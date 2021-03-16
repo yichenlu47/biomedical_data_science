@@ -1,0 +1,391 @@
+---
+title: "hw3"
+author: "Yichen Lu"
+date: "11/11/2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, cache = TRUE, echo = FALSE)
+knitr::opts_knit$set(root.dir = "C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/Fall20/BIOST544/")
+options(digits = 3)
+library(ggplot2)
+library(dplyr)
+library(knitr)
+library(readr)
+library(data.table)
+library(glmnet)
+```
+
+### Objective
+
+The goal is to investigate the relationship between gene-expression values in the tumor and the existence and extent of necrotic tissue. We do so by building a final model with genes selected.
+
+### Data cleaning
+
+We first loaded the three datasets `clinical_data`, `expression_data_probeID` and `annotation`. We merged datasets `clinical_data` and `expression_data_probeID` using variables `centerid` and `patid`, and only kept `probset` columns with corresponding `gene.names` as recorded in the  `annotation` dataset. The final dataset includes ~45K `probset`.
+
+```{r}
+clin <- read.csv("clinical_data.csv", header=TRUE)[,-1]
+expr <- fread("expression_data_probeID.csv", header = TRUE, sep = ',')[,-1]
+anno <- fread("annotation.csv", header = TRUE, sep = ',')
+
+# extract probset with corresponding gene
+anno.probset <- as.vector(t(anno[anno$gene.names != "", 1]))
+
+# check the class of the merging key
+if(typeof(expr$patid) != typeof(clin$patid)){
+  expr$centerid <- as.numeric(expr$centerid)
+  expr$patid <- as.numeric(expr$patid)
+}
+
+# merge the dataset
+dt <- inner_join(clin, expr, by=c("centerid","patid")) %>% select(c("necrotic_cells.pct", anno.probset)) 
+```
+
+
+### Screening-based method
+
+We first approach the question using the screening-based method. To eliminate the risk of overfittng due to multiplicity, we first divided the data into training and validation sets in a 3:1 ratio. We calculated the Kendall correlation between each individual `probset` and the outcome `necrotic_cells.pct` in the training set which has 114 records.
+
+In the next step, we wanted to find the most appropriate number of `probset` among to include in our final model. To do so, we ranked the `probset` based on their absolute Kendall correlation values and let **x** indicate that we will include the top **x** of `probset` with the high Kendall correlation in the final model. We tested **x** from 1 to 20. For each **x**, we built a linear model which regresses the response variable `necrotic_cells.pct` on the **x** `probset` in the training data and calculate the MSE using the validation datasets. We then chose the **x** that gives us the lowest MSE. In the end, we used the top **x** `probset` in our final linear model using all data, report the coefficients.
+
+```{r}
+set.seed(2)
+
+# split data
+train.test <- sample(1:nrow(dt), nrow(dt)/4 * 3, replace = FALSE) 
+train <- dt[train.test, ]
+test <- dt[-train.test, ]
+
+# check the correlation between each individual probset and outcome
+run.cor.test <- function(m, top){ 
+  cor.res <- as.data.frame(
+    apply(train[,-1], 2, function(i) 
+      cor.test(as.numeric(train$necrotic_cells.pct), 
+               as.numeric(i), method = m)$estimate)
+  )
+  cor.df <- as.data.frame(cbind(rownames(cor.res), cor.res))
+  colnames(cor.df) <- c("probset.id", "cor")
+  cor.rank <- cor.df %>% mutate(abs.cor = abs(as.numeric(cor))) %>%
+    arrange(desc(abs.cor))
+  return(cor.rank)
+}
+
+# output the probset in the order of strength of correlation
+spearman.cor.rank <- run.cor.test("spearman")
+kendall.cor.rank <- run.cor.test("kendall")
+
+# find the most appropriate number of probset to include in the model
+sel.num.var <- function(top.var){
+  var.list <- top.var$probset
+  MSE <- c()
+  for (i in 1:length(var.list)){
+    lm.formula <- paste("necrotic_cells.pct ~", paste0(var.list[1:i], collapse=' + ')) # fit the linear model using the probset
+    fit <- lm(as.formula(lm.formula), train)
+    preds <- predict(fit, test[, -1])
+    MSE[i] <- mean((test[,1] - preds)^2)
+  }
+  return(which.min(MSE))
+}
+```
+
+#### Kenall correlation
+
+With Kendall correlation, we ended up selecting top 5 `probset`: 
+
+```{r, include = TRUE}
+# find the most appropriate number of probset to include among the top 20
+kendall.num.cor <- sel.num.var(kendall.cor.rank[1:20,])
+
+# extract the probset list
+kendall.top.cor <- kendall.cor.rank[1:kendall.num.cor, 1]
+
+# find the corresponding gene
+kendall.top.gene <- anno[anno$probset.ids %in% kendall.top.cor,]
+kable(kendall.top.gene)
+```
+
+The final linear model with these selected `probset` is:
+<span style="color: blue">necrotic_cells.pct =  31.822 - 1.670 * X204917_s_at - 4.278 * X205255_x_at + 1.212 * X219151_s_at + 1.960 * X221779_at - 0.476 * X218309_at<span>
+
+```{r}
+# fit the final linear model with the probset selected
+lm.formula <- paste("necrotic_cells.pct ~", paste(kendall.top.cor, collapse=' + '))
+fit <- lm(as.formula(lm.formula), dt)
+```
+
+#### Spearman correlation
+
+We also replicate the same procedure using Spearman correlation. Unlike Pearson correlation which requires the a linear relationship between the two variables, the Spearman correlation only needs the two to follow a monotonic relationship. We ended up selecting top 7 `probset` this time with the Spearman correlation. Note that two `probset` are measuring the same gene.
+
+```{r, include = TRUE}
+# replicate the process using Spearman correlation
+spearman.num.cor <- sel.num.var(spearman.cor.rank[1:20,])
+spearman.top.cor <- spearman.cor.rank[1:spearman.num.cor, 1]
+spearman.top.gene <- anno[anno$probset.ids %in% spearman.top.cor,]
+kable(spearman.top.gene)
+```
+
+The final linear model with these selected `probset` using Spearman correlation is:
+<span style="color: blue"> necrotic_cells.pct = 17.913 - 1.569 * X204917_s_at - 3.667 * X205255_x_at + 0.952 * X219151_s_at + 1.511 * X221779_at + 0.573 * X55081_at - 0.344 * X218309_at + 0.899 * X1567213_at<span>
+
+```{r}
+lm.formula <- paste("necrotic_cells.pct ~", paste(spearman.top.cor, collapse=' + '))
+fit <- lm(as.formula(lm.formula), dt)
+```
+### Prediction-based approach
+
+We can also approach this problem using the prediction-based idea. We used 5-fold cross-validation to choose the most appropriate `lambda` to include in the final lasso mode. Again, we adopted the cross-validation process to decrease the risk of over-optimism from training and testing using the same dataset.
+
+We wanted to test 50 `lambda` values from 0 to 1. In the 5-fold cross-validation, we divided the entire dataset equally into 5 parts. For each round, we held one fold out and build 50 lasso models on the remaining 4 folds of the data. For each lasso model, we found the MSE when predicting outcome for that one held out fold. We then repeated this process for each of the fold so that for each of the 50 lasso models, we would have corresponding 5 MSE. We then averaged the MSE for each model and and extracted the `lambda` value in the lasso model with the lowest mean MSE. Lastly, we fit a lasso model on the entire dataset with the `lambda` value selected.
+
+When we include all 45K `probset` in the cross-validation process, the best `lambda` value chosen is 1, which leaves no `probset` but only the intercept in our final lasso model. This indicates that the model with just the intercept is better than any model that has any of the `probset` predictors. The intercept in the model would be the average of `necrotic_cells.pct`. This is a surprising result. 
+
+At first, we suspected that we only tested 50 `lambda` values. So we added two more tests: 1) increased the maximum `lambda` to 3 and tested 50 `lambda` values 2) kept the maximum `lambda` as 1 and increased the number of models to 100. However, all those methods returned a large `lambda` value which still left us with a final lasso model with intercept only.
+
+We also adjusted our cross-validation process to be 10-fold because we wanted to maximize the usage of our small sample. Yet, the best `lambda` value was still the largest in the testing range and returned a lasso model with intercept as the predictor only.
+
+```{r}
+# fit the lasso model 
+fit.my.model.lasso <- function(dat, lambda){
+  fit <- glmnet(x = dat[,-1], y = dat[,1], alpha = 1, lambda = lambda)
+  return(fit)
+}
+
+# evaluate the lasso model using MSE
+eval.my.model <- function(dat, mod){
+  preds <- predict(mod, dat[, -1])
+  MSE <- mean((dat[,1] - preds)^2)
+  return(MSE)
+}
+
+# find the lambda value with the smallest MSE in the cross-validation process
+find.best.lambda <- function(maxlambda, data, nfold, nlambda){
+  my.lambda.seq <- seq(maxlambda, 0, length.out=nlambda)
+  
+  datmat <- as.matrix(data)
+  
+  foldind <- sample(1:nfold, nrow(datmat), replace=TRUE)
+  
+  # cross-validation to build the lasso model on the training set
+  MSE <- matrix(0, nfold, nlambda)
+  for (i in 1:nfold){
+    for (j in 1:nlambda){
+      mod <- fit.my.model.lasso(datmat[foldind!=i,], my.lambda.seq[j])
+      MSE[i,j] <- eval.my.model(datmat[foldind==i,], mod)
+    }
+  }
+  MSE2 <- apply(MSE, 2, mean)
+  best.lambda <- my.lambda.seq[which.min(MSE2)]
+  
+  # fit the model using all data with the selected lambda value
+  full.fit <- fit.my.model.lasso(datmat, best.lambda)
+  
+  # extract covariates with coefficient > 0
+  coeff <- data.frame(coef.name = dimnames(coef(full.fit))[[1]], coef.value = matrix(coef(full.fit))) %>% filter(coef.value > 0) %>% select(coef.name)
+  
+  return(c(best.lambda, coeff))
+}
+```
+
+```{r, eval = FALSE}
+find.best.lambda(data = dt, maxlambda = 1, nfold = 5, nlambda = 50)
+find.best.lambda(data = dt, maxlambda = 3, nfold = 5, nlambda = 50)
+find.best.lambda(data = dt, maxlambda = 1, nfold = 5, nlambda = 100)
+find.best.lambda(data = dt, maxlambda = 1, nfold = 10, nlambda = 50)
+```
+
+#### Filter by variation first
+
+We then wondered if things would look different if we decrease the number of candidate `probset`. We ranked the `probset` based on the variation and we only included the top 100 `probset` with the largest variation. The rationale was that if the `probset` has small variation for all data points, then it wouldn't be a useful predictor. Using a 5-fold cross-validation to train the model on those 100 `probset`, `lambda` = 0.878 gave the lowest MSE. We then used this `lambda` to fit a lasso model on the entire dataset and the model included one predictor other than the intercept: X1568574_x_at.
+
+```{r}
+# calculate the variation of each probset
+var.res <- apply(dt[,-1], 2, function(i) var(i))
+
+# arrange probset in descending order of variation size
+var.df <- as.data.frame(cbind(rownames(as.data.frame(var.res)), var.res)) %>% arrange(desc(var.res))
+
+# choose the top 100 probsets with largest variation
+var.top <- var.df[1:100, 1]
+dt_var = dt %>% select(c("necrotic_cells.pct", var.top))
+
+set.seed(2)
+# find the lambda with the smallest MSE
+lasso.res <- find.best.lambda(data = dt_var , maxlambda = 1, nfold = 5, nlambda = 50)
+
+# extract the corresponding gene
+lasso.top.gene <- anno[anno$probset.ids %in% lasso.res[[2]],]
+kable(lasso.top.gene)
+```
+
+
+### APPENDIX
+
+#### Data cleaning
+```{r, eval = FALSE, echo = TRUE}
+# load the dataset
+clin <- read.csv("clinical_data.csv", header=TRUE)[,-1]
+expr <- fread("expression_data_probeID.csv", header = TRUE, sep = ',')[,-1]
+anno <- fread("annotation.csv", header = TRUE, sep = ',')
+
+# extract probset with corresponding gene
+anno.probset <- as.vector(t(anno[anno$gene.names != "", 1]))
+
+# check the class of the merging key
+if(typeof(expr$patid) != typeof(clin$patid)){
+  expr$centerid <- as.numeric(expr$centerid)
+  expr$patid <- as.numeric(expr$patid)
+}
+
+# merge the dataset
+dt <- inner_join(clin, expr, by=c("centerid","patid")) %>% select(c("necrotic_cells.pct", anno.probset)) 
+```
+
+#### Screening-based method
+
+```{r, eval = FALSE, echo = TRUE}
+set.seed(2)
+
+# split data
+train.test <- sample(1:nrow(dt), nrow(dt)/4 * 3, replace = FALSE) 
+train <- dt[train.test, ]
+test <- dt[-train.test, ]
+
+# check the correlation between each individual probset and outcome
+run.cor.test <- function(m, top){ 
+  cor.res <- as.data.frame(
+    apply(train[,-1], 2, function(i) 
+      cor.test(as.numeric(train$necrotic_cells.pct), 
+               as.numeric(i), method = m)$estimate)
+  )
+  cor.df <- as.data.frame(cbind(rownames(cor.res), cor.res))
+  colnames(cor.df) <- c("probset.id", "cor")
+  cor.rank <- cor.df %>% mutate(abs.cor = abs(as.numeric(cor))) %>%
+    arrange(desc(abs.cor))
+  return(cor.rank)
+}
+
+# output the probset in the order of strength of correlation
+spearman.cor.rank <- run.cor.test("spearman")
+kendall.cor.rank <- run.cor.test("kendall")
+
+# find the most appropriate number of probset to include in the model
+sel.num.var <- function(top.var){
+  var.list <- top.var$probset
+  MSE <- c()
+  for (i in 1:length(var.list)){
+    lm.formula <- paste("necrotic_cells.pct ~", paste0(var.list[1:i], collapse=' + ')) # fit the linear model using the probset
+    fit <- lm(as.formula(lm.formula), train)
+    preds <- predict(fit, test[, -1])
+    MSE[i] <- mean((test[,1] - preds)^2)
+  }
+  return(which.min(MSE))
+}
+```
+
+##### Kendall correlation
+
+```{r, eval = FALSE, echo = TRUE}
+# find the most appropriate number of probset to include among the top 20
+kendall.num.cor <- sel.num.var(kendall.cor.rank[1:20,])
+
+# extract the probset list
+kendall.top.cor <- kendall.cor.rank[1:kendall.num.cor, 1]
+
+# find the corresponding gene
+kendall.top.gene <- anno[anno$probset.ids %in% kendall.top.cor,]
+kable(kendall.top.gene)
+
+# fit the final linear model with the probset selected
+lm.formula <- paste("necrotic_cells.pct ~", paste(kendall.top.cor, collapse=' + '))
+fit <- lm(as.formula(lm.formula), dt)
+```
+
+##### Spearman correlation
+
+```{r, eval = FALSE, echo = TRUE}
+# replicate the process using Spearman correlation
+spearman.num.cor <- sel.num.var(spearman.cor.rank[1:20,])
+spearman.top.cor <- spearman.cor.rank[1:spearman.num.cor, 1]
+spearman.top.gene <- anno[anno$probset.ids %in% spearman.top.cor,]
+kable(spearman.top.gene)
+
+lm.formula <- paste("necrotic_cells.pct ~", paste(spearman.top.cor, collapse=' + '))
+fit <- lm(as.formula(lm.formula), dt)
+```
+
+#### Prediction-based method
+
+```{r, eval = FALSE, echo = TRUE}
+# fit the lasso model 
+fit.my.model.lasso <- function(dat, lambda){
+  fit <- glmnet(x = dat[,-1], y = dat[,1], alpha = 1, lambda = lambda)
+  return(fit)
+}
+
+# evaluate the lasso model using MSE
+eval.my.model <- function(dat, mod){
+  preds <- predict(mod, dat[, -1])
+  MSE <- mean((dat[,1] - preds)^2)
+  return(MSE)
+}
+
+# find the lambda value with the smallest MSE in the cross-validation process
+find.best.lambda <- function(maxlambda, data, nfold, nlambda){
+  my.lambda.seq <- seq(maxlambda, 0, length.out=nlambda)
+  
+  datmat <- as.matrix(data)
+  
+  foldind <- sample(1:nfold, nrow(datmat), replace=TRUE)
+  
+  # cross-validation to build the lasso model on the training set
+  MSE <- matrix(0, nfold, nlambda)
+  for (i in 1:nfold){
+    for (j in 1:nlambda){
+      mod <- fit.my.model.lasso(datmat[foldind!=i,], my.lambda.seq[j])
+      MSE[i,j] <- eval.my.model(datmat[foldind==i,], mod)
+    }
+  }
+  MSE2 <- apply(MSE, 2, mean)
+  best.lambda <- my.lambda.seq[which.min(MSE2)]
+  
+  # fit the model using all data with the selected lambda value
+  full.fit <- fit.my.model.lasso(datmat, best.lambda)
+  
+  # extract covariates with coefficient > 0
+  coeff <- data.frame(coef.name = dimnames(coef(full.fit))[[1]], coef.value = matrix(coef(full.fit))) %>% filter(coef.value > 0) %>% select(coef.name)
+  
+  return(c(best.lambda, coeff))
+}
+
+find.best.lambda(data = dt, maxlambda = 1, nfold = 5, nlambda = 50)
+find.best.lambda(data = dt, maxlambda = 3, nfold = 5, nlambda = 50)
+find.best.lambda(data = dt, maxlambda = 1, nfold = 5, nlambda = 100)
+find.best.lambda(data = dt, maxlambda = 1, nfold = 10, nlambda = 50)
+```
+
+##### Filter by variation first
+```{r, eval = FALSE, echo = TRUE}
+# calculate the variation of each probset
+var.res <- apply(dt[,-1], 2, function(i) var(i))
+
+# arrange probset in descending order of variation size
+var.df <- as.data.frame(cbind(rownames(as.data.frame(var.res)), var.res)) %>% arrange(desc(var.res))
+
+# choose the top 100 probsets with largest variation
+var.top <- var.df[1:100, 1]
+dt_var = dt %>% select(c("necrotic_cells.pct", var.top))
+
+set.seed(2)
+# find the lambda with the smallest MSE
+lasso.res <- find.best.lambda(data = dt_var , maxlambda = 1, nfold = 5, nlambda = 50)
+
+# extract the corresponding gene
+lasso.top.gene <- anno[anno$probset.ids %in% lasso.res[[2]],]
+kable(lasso.top.gene)
+```

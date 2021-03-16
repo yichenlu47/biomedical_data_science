@@ -1,0 +1,203 @@
+---
+title: "BIOST 544 Homework 1"
+author: "Yichen Lu"
+date: "10/20/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE, cache = TRUE)
+knitr::opts_knit$set(root.dir = "C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/Fall20/BIOST544/") ## Set this to your own working directory
+# options(digits = 3) ## Formats output to 3 digits
+library(ggplot2)
+library(dplyr)
+library(knitr)
+
+nsim <- 1e4
+```
+
+There is a belief that the effectiveness of the anti-angiogenesis agent TFD725 (evaluated in the nsclc dataset) may be different for older vs younger patients. We will use the nsclc dataset to attempt to evaluate this.
+
+1. As a first pass, we will consider a few subgroups of patients: Those 50 and older (50+), 55+, 60+, 65+, and 70+. Please estimate/evaluate the probability a patient on TFD725+docetaxel will survive past 400 days in each of those subgroups. Please also give an interval estimate for each of those probabilities
+
+```{r, include = FALSE}
+dt <- read.delim("nsclc-modified.txt", sep = " ")
+summary(dt$age) # no missing values
+dt$age_grp <- ifelse(dt$age < 50, "<50", ifelse(dt$age<55, "50-54",ifelse(dt$age<60, "55-59", ifelse(dt$age<65, "60-64", ifelse(dt$age<70, "65-69", ">=70")))))
+dt$age_grp <- factor(dt$age_grp, levels = c("<50", "50-54","55-59", "60-64", "65-69", ">=70"))
+
+table(dt$age_grp, useNA = "always")
+
+colnames(dt)
+age_list <- c("<50", "50-54","55-59", "60-64", "65-69", ">=70")
+prob_age <- dt %>% group_by(age_grp) %>% 
+  summarise(n.tx = sum(tx == 1), n.control = sum(tx == 0),
+            n.tx.survival =  sum(tx == 1 & survival.past.400 == 1),   
+            n.control.survival = sum(tx == 0 & survival.past.400 == 1),
+            prob.tx = n.tx.survival/n.tx,
+            prob.control = ifelse(n.control == 0, NA, n.control.survival/n.control),
+            prob.diff = prob.tx - prob.control,
+            se.tx = sqrt(prob.tx*(1-prob.tx)/n.tx),
+            lower.tx = prob.tx - 1.96 * se.tx, upper.tx = prob.tx + 1.96 * se.tx)
+
+# clean the table for presentation
+table1 <- as.data.frame(prob_age) %>% filter(age_grp !=  "<50") %>% 
+  mutate("Age group" = age_grp, 
+         "Probability of survival past 400 days" = round(prob.tx, digits = 2),
+         "95% CI"= paste0("(", round(lower.tx, digits = 2), ", ", round(upper.tx, digits = 2), ")")) %>% 
+  select(c("Age group", "Probability of survival past 400 days", "95% CI"))
+table1$"Age group" <- factor(table1$"Age group", levels = c("50-54","55-59", "60-64", "65-69", ">=70"))
+```
+
+<span style="color: blue">We first break patients into age groups and calculate the probability a patient on TFD725 + docetaxel will survive past 400 days as the proportion of patients on this treatment in the subgroup who survived past 400 days among the total number of patients in the age group.<span>
+
+<span style="color: blue">The standard error of such estimate can be calculated following the formula of $\sqrt{p(1-p)/n}$ where p indicates the proportion of patients who survived and n corresponds to the number of patients in each age subgroup. Using the SE, the 95% confidence interval can be calculated as p +/- 1.96 * se. The results are shown in **Table 1**.<span>
+
+```{r, echo = FALSE, include = TRUE} 
+kable(table1, caption = "Table 1: Probability of survival by age group")
+```
+
+```{r}
+# find the 95% CI using simulation
+candidate_pi_101 <- seq(from = 0, to = 1, length.out = 101)
+
+calc.conf <- function(n, prob.tx){
+  percentiles_101 <- c()
+
+  for(pi in candidate_pi_101){
+    samp_counts <- rbinom(nsim, n, pi)
+    samp_dist <- samp_counts/n
+    
+    percentile <- mean(samp_dist <= prob.tx)
+    percentiles_101 <- c(percentiles_101, percentile)
+  }
+  
+  return(percentiles_101)
+}
+
+
+sim_age <- lapply(age_list, function(i){
+  dt_age <- dt[dt$age_grp == i,]
+  prob.tx <- nrow(dt_age[dt_age$tx == 1 & dt_age$survival.past.400 == 1,])/nrow(dt_age[dt_age$tx == 1,])
+  calc.conf(nrow(dt_age), prob.tx)
+})
+
+
+sim_age_ci <- lapply(seq(1:length(age_list)), function(i){
+  dt_age <- dt[dt$age_grp == age_list[i],]
+  prob.tx <- nrow(dt_age[dt_age$tx == 1 & dt_age$survival.past.400 == 1,])/nrow(dt_age[dt_age$tx == 1,])
+  
+  (consistent_pi <- candidate_pi_101[(sim_age[[i]] >= 0.05) & (sim_age[[i]] <= 0.95)])
+  lower.tx <- min(consistent_pi)
+  upper.tx <- max(consistent_pi)
+  c("i" = i, "prob.tx" = prob.tx, "lower.tx" = lower.tx, "upper.tx" = upper.tx)
+})
+
+table1_simu <- as.data.frame(do.call(rbind, sim_age_ci)) %>% filter(i > 1) %>%
+  mutate("Age group" = age_list[i],
+         "Probability of survival past 400 days" = round(prob.tx, digits = 2),
+         "95% CI"= paste0("(", round(lower.tx, digits = 2), ", ", round(upper.tx, digits = 2), ")")) %>% 
+  select(c("Age group", "Probability of survival past 400 days", "95% CI"))
+```
+
+<span style="color: blue">We can also find the 95% CI using simulation. The results are shown in **Table 2**. <span>
+
+```{r, echo = FALSE, include = TRUE} 
+kable(table1_simu, caption = "Table 2: Probability of survival by age group using simulation")
+```
+
+<span style="color: blue">We test 101 values in the range of 0 to 1 for probability of survival past 400 days for patients taking TFD725 + docetaxel. For each value, we run 10,000 simulations and find the number of times when the simulated probability of survival past 400 days is equivalent or smaller than the observed value for patients on TFD725 + docetaxel. The result is illustrated in the graphs below. The 95% CI of the estimate consists of testing probabilities that have over 95% chance of getting the observed value or smaller. <span>
+
+```{r, echo = FALSE, include = TRUE} 
+for (i in 2:length(age_list)){
+  plot(candidate_pi_101, sim_age[[i]], 
+       main = paste0("Probability to survive past 400 days \namong patients taking TFD725 + docetaxel of age ", age_list[i]), 
+       xlab ="Probability to survive past 400 days", 
+       ylab = "Probability of getting observed value or smaller")
+  abline(h = 0.05, col = "red")
+  abline(h = 0.95, col = "red")
+}
+```
+
+
+2. Now, in each of those subgroups evaluate whether TFD725 + docetaxel is more effective than docetaxel alone (and the magnitude of any potential treatment effect). In addition, evaluate if the treatment effect appears to substantively and/or systematically differ across age (or if the data doesn’t give a clear answer to this).
+
+```{r, include = FALSE}
+perm.tx <- function(data){
+  perm <- sample(1:nrow(data), replace = FALSE)
+  perm.data <- data
+  perm.data$tx = data$tx[perm]
+  with(perm.data, mean(obstime[tx == 1]) - mean(obstime[tx == 0]))
+}
+
+perm_age <- lapply(age_list, function(i){
+  dt_age <- dt[dt$age_grp == i,]
+  data.frame("perm.mean.diff" = replicate(nsim, perm.tx(dt_age)))
+})
+
+perm_age_pval <- lapply(seq(1:length(age_list)), function(i){
+  dt_age <- dt[dt$age_grp == age_list[i],]
+  mean.diff <- with(dt_age, mean(obstime[tx == 1]) - mean(obstime[tx == 0]))
+  pval <- mean(perm_age[[i]] >= mean.diff)
+  c("i" = i, "n" = nrow(dt_age), "mean.diff" = mean.diff, "pval" = pval)
+})
+
+table2_perm <- as.data.frame(do.call(rbind, perm_age_pval)) %>% filter(i > 1) %>%
+  mutate("Age group" = age_list[i],
+         "N" = n,
+         "Difference in treatment effect measured by mean observation time" = round(mean.diff, digits = 2),
+         "P-value"= round(pval, digits = 2)) %>% 
+  select(c("Age group", "N", "Difference in treatment effect measured by mean observation time", "P-value"))
+```
+
+<span style="color: blue">First, we want to compare the effect of the two treatments in each age group using the difference in the mean observation time from randomization to death or data analysis for the TFD725 + docetaxel compared to the docetaxel group. Within each age group, we start with permuting the treatment assignment for the patients. We are trying to test the null hypothesis that for each age group, the observation time is not associated with the treatment given to the patient. **Table 3** shows the number of patients in each age group, the observed observation difference and the p-values corresponding to the treatment difference.<span>
+
+```{r, echo = FALSE, warning = FALSE, include = TRUE} 
+kable(table2_perm, caption = "Table 3: TFD725 + docetaxel vs docetaxel by age group using permutation")
+```
+
+<span style="color: blue">The p-values are calculated based on the density plots: the area under the curve on the right hand side of the plot indicates the probability of getting a difference in mean observation time equivalent to what we observed in the data or more extreme. In this case, we see that for patients of age 50 to 54 years old, TFD725 + docetaxel significantly increases the observation time for patients compared to docetaxel alone at the significance level of 0.05. In this group, we can say that TFD725 + docetaxel is more effective than docetaxel alone. On the other hand, permutation results in other groups is associated with large p-values and hence we fail to reject the null hypothesis that patients administrated with TFD725 + docetaxel and docetaxel along have the same observation time.<span>
+
+```{r, echo = FALSE, warning = FALSE, include = TRUE} 
+for (i in 2:length(age_list)){
+  dt_age <- dt[dt$age_grp == age_list[i],]
+  mean.diff <- with(dt_age, mean(obstime[tx == 1]) - mean(obstime[tx == 0]))
+  
+  g <- ggplot(as.data.frame(perm_age[[i]]), aes(x=perm.mean.diff, y=..density..)) +
+    geom_histogram(alpha=0.5, position="identity")+
+    geom_density() + geom_vline(xintercept=mean.diff, colour = "orange") +
+    labs(title=paste0("Treatment effect of TFD725 + docetaxel compared to docetaxel \namong patients of age ", age_list[i]),
+         x ="Mean in observation time (days)", y = "Density")
+  print(g)
+}
+```
+
+<span style="color: blue"> If we only look at the mean difference in observation time across the age groups, it seems like the treatment effect substantively differ across age. But we won't know if the difference is actually large or it seems large because we have very small sample size. To better see if mean observation time for TFD725 + docetaxel cohort differs across age, we plot the observation time for each patient against their age and stratified by the treatment. For each treatment group, we fit a smooth line and we see that the confidence intervals for the two smooth line overlap for patients of ages between 50 to 71 years old. Therefore, we can not conclude that treatment effect substantively differs across age. <span>
+
+```{r}
+dt %>%
+  ggplot(aes(x = age, y = obstime, color = as.factor(tx))) + 
+  geom_point() + 
+  geom_smooth() + 
+  labs(title = "Observation time of TFD725 + docetaxel vs docetaxel by age",
+       x ="Age", y = "Observation time (days)") + 
+  scale_colour_discrete(name = "Treatment", labels = c("Docetaxel", "TFD725 + docetaxel"))
+```
+
+<span style="color: blue"> We can also build a linear regression model with an interaction term between treatment and age to see if age affect the treatment difference between TFD725 + docetaxel vs docetaxel. The model looks like the following with dependent variable observation time, predictor of interest treatment, continuous variable age and the interaction term: **E[observation time] = 375.55 + 66.01 * treatment + 0.004 * age - 0.68 * treatment * age**.<span>
+
+<span style="color: blue">When we compare the patients of the same age, the advantages in the observation time for patients on TFD725 + docetaxel over patients on docetaxel alone is smaller for elder patients than younger patients. <span>
+
+<span style="color: blue">For example, 55-year-old patients taking TFD725 + docetaxel will have observation time 66.00552 - 0.68210 * 55 = 28.5 days longer compared to those 55-year-old patients taking docetaxel alone. The difference in observation time decreases to 66.00552 - 0.68210 * 60 = 25.1 days for 60-year-old patients. <span>
+
+<span style="color: blue">However, the interaction term is associated with a p-value of 0.85. So at the significance level of 0.05, we can not reject the null hypothesis that the relationship between treatment and observation time is affected by the age. The conclusion remains the same if we replace the continuous age variable to the categorical age group variable. <span>
+
+```{r, eval = FALSE}
+mod <- lm(obstime ~ as.factor(tx)*age, data = dt)
+summary(mod)
+66.00552 - 0.68210 * 55
+66.00552 - 0.68210 * 60
+
+mod <- lm(obstime ~ as.factor(tx)*age_grp, data = dt)
+summary(mod)
+```

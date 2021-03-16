@@ -1,0 +1,459 @@
+---
+title: "Homework 4"
+author: "Yichen Lu"
+date: "12/2/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, cache = TRUE, echo = FALSE)
+knitr::opts_knit$set(root.dir = "C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/Fall20/BIOST544/")
+options(digits = 5)
+library(foreign)
+library(ggplot2)
+library(dplyr)
+library(knitr)
+library(readr)
+library(data.table)
+library(glmnet)
+library(kableExtra)
+```
+
+### Definitions
+
+The original data set includes information for 3,302 patients. To understand the association between smoking and bone density for middle-aged women, we first defined the outcome of interest as the sum of total hip bone mineral density (BMD) and total spine BMD. This is a continuous variable. 
+
+The predictor of interest is whether the patient has ever smoker regularly measured as at least 20 packs of cigarettes over life time or at least 1 cigarette per day for at least 1 year. This is a binary variable. 15 patients entered "Missing", 10 patients entered "Do not know" and 5 patients have missing values for this predictor. These 29 patients were all recorded as having missing values for whether they were regular smokers, and were excluded from the analysis.
+
+```{r}
+dt <- read.dta("C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/Fall20/BIOST544/SWANdata_visit0/SWANdata_visit0/28762-0001-Data.dta")
+# colnames(dt)
+dt.clean <- dt
+# summary(dt$HPBMDT0) # Total Hip Bone Mineral Desnity w/cross-calibration applied
+# summary(dt$SPBMDT0) # Total Spine BMD w/cross-calibration applied
+dt.clean$BMD = dt$HPBMDT0 + dt$SPBMDT0
+# summary(dt.clean$BMD)
+
+# exposure
+# table(dt$SMOKERE0, useNA = "always") # Ever smoked regularly/smoked a total of at least 20 packs of cigarettes over your lifetime or at least 1 cigarette per day for at least 1 year? 
+dt.clean$regular_smoker =  ifelse(dt$SMOKERE0 %in% c("Missing", "Do not know", "Refused", "N/A"), NA, ifelse(dt$SMOKERE0 == "Yes", 1, 0))
+# table(dt.clean$regular_smoker)
+t1 <- dt.clean %>% group_by(regular_smoker) %>% 
+  summarize(n = n(),
+            "percentage" = round(n()/nrow(dt.clean), 2)) %>% filter(!is.na(regular_smoker))
+t1$regular_smoker = ifelse(t1$regular_smoker == 1, "Yes", "No")
+kable(t1, caption = "Table 1: frequency of regular smoker", align = "lrr")
+```
+
+We then consider potential confounders including patients' age, servings of alcoholic beverages daily, number of members of the household smoking tobacco in the house, number of days exposed to tobacco smoke while at work, and total hours exposed to tobacco smoke while at places other than home or work. We believe these variables affected both whether the patient was a regular smoker and their BMD. Patients with missing values for these confounders were excluded from the analysis as well. The complete dataset includes 2,097 patients.
+
+```{r}
+# potential confounders
+# summary(dt$AGE0) # Calculated from date of birth and when the form was completed, and is rounded to the next lowest integer
+# summary(dt$ALCHSRV0) # servings of ALCOHOLIC Beverages daily
+
+# num. of members of your household smoke tobacco in the house (at least 1 cigarette, cigar or pipe bowl per day)
+# table(dt$HHMEMSM0, useNA = "always") 
+dt.clean$num.smoker.house = ifelse(dt$HHMEMSM0 == -9, NA, dt$HHMEMSM0)
+# table(dt.clean$house.smoker, useNA = "always")
+
+# days exposed to tobacco smoke while at work
+# table(dt$WRKEXPD0, useNA = "always") 
+dt.clean$days.smoke.work = ifelse(dt$WRKEXPD0 < 0, NA, dt$WRKEXPD0)
+# table(dt.clean$days.smoke.work, useNA = "always")
+
+# total hours exposed to tobacco smoke while at places other than home or work
+# table(dt$TOTEXPH0, useNA = "always") 
+dt.clean$hours.smoke.other = ifelse(dt$TOTEXPH0 < 0, NA, dt$TOTEXPH0)
+# table(dt.clean$hours.smoke.other, useNA = "always")
+
+
+# precision (affect BMD, but not associated with smoking)
+# summary(dt$HEIGHT0)
+# summary(dt$WEIGHT0)
+# summary(dt$DTTCALC0) # DAILY DIETARY ESTIMATE CALCIUM, mg
+
+dt.complete <- dt.clean %>% select(BMD, regular_smoker,
+                                   AGE0, ALCHSRV0, 
+                                   num.smoker.house, days.smoke.work, hours.smoke.other) %>% na.omit() 
+# only include complete data
+t2 <- dt.complete %>% group_by(regular_smoker) %>% 
+  summarize(n = n(),
+            "percentage" = round(n()/nrow(dt.clean), 2), 
+            "average BMD" = mean(BMD),
+            "average alcohol consumption" = mean(ALCHSRV0), 
+            "average number of smoker in the household" =mean(num.smoker.house), 
+            "average hours exposed to smoke at work" = mean(days.smoke.work), 
+            "average hours exposed to smoke at other places" = mean(hours.smoke.other))
+t2$regular_smoker = ifelse(t2$regular_smoker == 1, "Yes", "No")
+kable(t2, caption = "Table 2: summary statistics of variables", align = "lrrrrrrr")
+```
+
+### Data analysis
+
+To start with the analysis, we first look at the mean difference in BMD between the regular smoker and non-regular smokers ignoring these confounders.
+
+```{r}
+# mean difference ignoring confounding
+(obs_mean_diff <- with(dt.complete, mean(BMD[regular_smoker == 1]) - mean(BMD[regular_smoker == 0])))
+```
+
+We also ran a permutation test to see if BMD differs significantly across the regular smokers and non-regular smokers without considering these confounders. In figure 1, the red vertical line marks the observed mean difference in BMD between the regular smoker and non-regular smokers ignoring confounders.
+
+```{r}
+# permutation
+permute.BMD <- function(data){
+  # create the permuted data
+  perm <- sample(1:nrow(data), replace = FALSE)
+  perm.data <- data
+  perm.data$regular_smoker = data$regular_smoker[perm]
+  
+  # calculate the mean differences on permuted data
+  perm.mean.diff <- with(perm.data,
+                         mean(BMD[regular_smoker == 1]) - mean(BMD[regular_smoker == 0]))
+  return(perm.mean.diff)
+}
+
+set.seed(47)
+sampling.dist <- data.frame(replicate(1e4, permute.BMD(dt.complete)))
+colnames(sampling.dist) <- "perm_mean_diff"
+
+p <- mean(sampling.dist > obs_mean_diff)
+
+ggplot(sampling.dist, aes(x = perm_mean_diff, y=..density..)) +
+  geom_density() + 
+  geom_vline(xintercept = obs_mean_diff, color = "red") + 
+  labs(title = "Figure 1. Permutated mean difference in BMD between smokers vs non-smokers",
+       x = "Mean difference generated from permutation")
+```
+
+We obtained a p-value of 
+
+```{r}
+mean(sampling.dist > obs_mean_diff)
+```
+
+which means without adjusting for any confounders, we were able to reject the null hypothesis that there's no association between smoking and BMD at significance level of 0.05.
+
+### Confounders
+
+Although we found a strong association between regular smoker and BMD, we can not be so sure if this is a fair conclusion given all the confounding variables. So we now include these confounding variables and see if such strong effect still preserves. Here we adopted a propensity scores approach to account for the confounding effect. We ran a logistic regression with regular smoker being the dependent variable and all the confounders being the independent variable. Based on this model, we assigned each patient in our sample a propensity score indicating the probability of them being a regular smoker given their confounding variable values. Figure 2 shows the propensity stratified by smoking status.
+
+```{r}
+# propensity score
+propen.model <- glm(regular_smoker ~ AGE0 + ALCHSRV0 + 
+                      num.smoker.house + days.smoke.work + hours.smoke.other, family=binomial, data=dt.complete)
+
+propensities <- predict(propen.model, data=dt.complete, type="response")
+dt.pred.propen <- data.frame(propensities=propensities, regular_smoker=dt.complete$regular_smoker)
+
+ggplot(dt.pred.propen, 
+       aes(x = propensities, y = ..density.., color = (regular_smoker == 1))) +
+  geom_density() + 
+  labs(title = "Figure 2. propensity scores by regular smoking status", 
+       color = "Regular Smoker?",
+       x = "Propensity scores")
+```
+
+We noticed that some propensity scores were close to 1 and 0, which could create problems when we weighted the outcome. So we truncated the propensity score to include values fell between the middle 90%. The rango of the truncated propensity score is
+
+```{r}
+trunc.propen <- propensities %>% pmin(0.95) %>% pmax(0.05) ## pmin/pmax gives pointwise min/max
+range(trunc.propen)
+```
+
+We then incorporated the propensity score into our estimating of average smoking effect on BMD using inverse probability weighting. For patients in the smoker group, their BMD was reweighed using the percentage of smokers in the group divided by their propensity score. For patients in the non-smoker group, their BMD was re-weighted using percentage of non-smokers in the group divided by their propensity score. We plotted these weights below in Figure 3.
+
+```{r}
+npat <- nrow(dt.complete)
+weights <- rep(0, npat)
+
+## for patients who are regular smoker
+representative.propen <- sum(dt.complete$regular_smoker) / npat
+actual.propen <- trunc.propen
+
+regular_smoker.ind <- which(dt.complete$regular_smoker == 1)
+weights[regular_smoker.ind] <- representative.propen/actual.propen[regular_smoker.ind]
+weights[-regular_smoker.ind]<- (1 - representative.propen)/(1- actual.propen[-regular_smoker.ind])
+
+ggplot(data.frame(weights = weights), aes(x=weights, y =..density..)) + 
+  geom_histogram() + labs(title = "Figure 3. weights for the study population (N = 2097)")
+```
+
+We then estimated the smoker effect with the weighted BMD and obtained a mean difference of 
+
+```{r}
+# new estimate with inverse weight
+regular_smoker.prob.est <- with(dt.complete,
+                                mean((weights*BMD)[regular_smoker.ind]))
+non_regular_smoker.prob.est <- with(dt.complete,
+                                    mean((weights*BMD)[-regular_smoker.ind]))
+(propen.diff <- regular_smoker.prob.est - non_regular_smoker.prob.est)
+```
+which is much smaller compared to the mean difference in BMD by smoker without weighting (0.031). To see if such difference happened by chance, we again ran a permutation test with propensity score and inverse probability weighting included. The permutated mean difference was plotted in Figure 4.
+
+```{r}
+# permutation with propensity score
+permute.propen <- function(data){
+  n <- length(data$BMD)
+  label <- rbinom(n,1,trunc.propen)
+  weights <- rep(0,n)  
+  representative <- mean(label)
+  actual <- trunc.propen
+  ind.t <- which(label == 1)
+  weights[ind.t] <- (representative/actual)[ind.t]
+  weights[-ind.t] <- ((1-representative)/(1-actual))[-ind.t]
+  perm.propen.diff <- with(data, mean((weights*BMD)[ind.t]) - mean((weights*BMD)[-ind.t]))
+  return(perm.propen.diff)
+}
+
+set.seed(47)
+rerandomized.diffs <- data.frame(replicate(1e3, permute.propen(dt.complete)))
+colnames(rerandomized.diffs) <- "perm.propen.diff"
+ggplot(data.frame(diffs = rerandomized.diffs), 
+       aes(x = perm.propen.diff, y = ..density..)) +
+  geom_density() + 
+  geom_vline(xintercept = propen.diff, color = "red") + 
+  labs(title = "Figure 4. Permutated weighted mean difference in BMD between smokers vs non-smokers",
+       x = "Weighted mean difference generated from permutation")
+```
+
+The permutation tests returns a p-value of
+
+```{r}
+mean(rerandomized.diffs > propen.diff)
+```
+
+which shows we don't have sufficient evidence to reject the null hypothesis that there's no association between being a regular smoker and BMD after adjusting for confounders using propensity score and inverse probability weighting. Although this was quite different from what we had when we did not adjust for confounders, we should still adjust for those covariates if we believed they affected the BMD and smoking status.
+
+### Standardization
+
+As an alternative, we also checked the mean difference in BMD by smoking using standardization. Because BMD is a continuous variable, we used a linear regression model to model the relationship between BMD and smoking status and included all the confounders. We then calculated the predicted BMD for the study population assuming all of them are smokers and the predicted BMD for the study population assuming all of them are non-smokers. Using standardization, we obtained a mean difference in BMD of
+
+```{r}
+outcome.regression <- lm(BMD ~ regular_smoker + AGE0 + ALCHSRV0 + 
+                           num.smoker.house + days.smoke.work + hours.smoke.other, data=dt.complete)
+
+dt.regular_smoker <- dt.complete %>% mutate(regular_smoker = 1)
+dt.non_regular_smoker <- dt.complete %>% mutate(regular_smoker = 0)
+
+(standardized.est <- mean(  predict(outcome.regression, 
+                                    dt.regular_smoker, 
+                                    type = "response") -
+                              predict(outcome.regression, 
+                                      dt.non_regular_smoker, 
+                                      type = "response")))
+```
+We can also dichotomized BMD using the median BMD value. In this case, we used a logistic regression model to model the relationship between the binary BMD and smoking status and included all the confounders. We obtained a mean difference in BMD of 
+
+```{r}
+dt.complete$high_BMD <- (dt.complete$BMD > median(dt.complete$BMD))
+outcome.regression <- glm(high_BMD ~ regular_smoker + AGE0 + ALCHSRV0 + 
+                           num.smoker.house + days.smoke.work + hours.smoke.other, 
+                         family = "binomial", data=dt.complete)
+
+dt.regular_smoker <- dt.complete %>% mutate(regular_smoker = 1)
+dt.non_regular_smoker <- dt.complete %>% mutate(regular_smoker = 0)
+
+(standardized.est <- mean(predict(outcome.regression, 
+                                    dt.regular_smoker, 
+                                    type = "response") -
+                              predict(outcome.regression, 
+                                      dt.non_regular_smoker, 
+                                      type = "response")))
+```
+
+### Appendix: code
+
+```{r, include = TRUE, eval = FALSE, echo = TRUE}
+options(digits = 5)
+library(foreign)
+library(ggplot2)
+library(dplyr)
+library(knitr)
+library(readr)
+library(data.table)
+library(glmnet)
+library(kableExtra)
+
+## Definitions
+dt <- read.dta("C:/Users/luy85/Google Drive (luyichen1994@gmail.com)/UW Seattle/Fall20/BIOST544/SWANdata_visit0/SWANdata_visit0/28762-0001-Data.dta")
+# colnames(dt)
+dt.clean <- dt
+# summary(dt$HPBMDT0) # Total Hip Bone Mineral Desnity w/cross-calibration applied
+# summary(dt$SPBMDT0) # Total Spine BMD w/cross-calibration applied
+dt.clean$BMD = dt$HPBMDT0 + dt$SPBMDT0
+# summary(dt.clean$BMD)
+
+# exposure
+# table(dt$SMOKERE0, useNA = "always") # Ever smoked regularly/smoked a total of at least 20 packs of cigarettes over your lifetime or at least 1 cigarette per day for at least 1 year? 
+dt.clean$regular_smoker =  ifelse(dt$SMOKERE0 %in% c("Missing", "Do not know", "Refused", "N/A"), NA, ifelse(dt$SMOKERE0 == "Yes", 1, 0))
+# table(dt.clean$regular_smoker)
+t1 <- dt.clean %>% group_by(regular_smoker) %>% 
+  summarize(n = n(),
+            "percentage" = round(n()/nrow(dt.clean), 2)) %>% filter(!is.na(regular_smoker))
+t1$regular_smoker = ifelse(t1$regular_smoker == 1, "Yes", "No")
+kable(t1, caption = "Table 1: frequency of regular smoker", align = "lrr")
+
+# potential confounders
+# summary(dt$AGE0) # Calculated from date of birth and when the form was completed, and is rounded to the next lowest integer
+# summary(dt$ALCHSRV0) # servings of ALCOHOLIC Beverages daily
+
+# num. of members of your household smoke tobacco in the house (at least 1 cigarette, cigar or pipe bowl per day)
+# table(dt$HHMEMSM0, useNA = "always") 
+dt.clean$num.smoker.house = ifelse(dt$HHMEMSM0 == -9, NA, dt$HHMEMSM0)
+# table(dt.clean$house.smoker, useNA = "always")
+
+# days exposed to tobacco smoke while at work
+# table(dt$WRKEXPD0, useNA = "always") 
+dt.clean$days.smoke.work = ifelse(dt$WRKEXPD0 < 0, NA, dt$WRKEXPD0)
+# table(dt.clean$days.smoke.work, useNA = "always")
+
+# total hours exposed to tobacco smoke while at places other than home or work
+# table(dt$TOTEXPH0, useNA = "always") 
+dt.clean$hours.smoke.other = ifelse(dt$TOTEXPH0 < 0, NA, dt$TOTEXPH0)
+# table(dt.clean$hours.smoke.other, useNA = "always")
+
+
+dt.complete <- dt.clean %>% select(BMD, regular_smoker,
+                                   AGE0, ALCHSRV0, 
+                                   num.smoker.house, days.smoke.work, hours.smoke.other) %>% na.omit() 
+# only include complete data
+t2 <- dt.complete %>% group_by(regular_smoker) %>% 
+  summarize(n = n(),
+            "percentage" = round(n()/nrow(dt.clean), 2), 
+            "average BMD" = mean(BMD),
+            "average alcohol consumption" = mean(ALCHSRV0), 
+            "average number of smoker in the household" =mean(num.smoker.house), 
+            "average hours exposed to smoke at work" = mean(days.smoke.work), 
+            "average hours exposed to smoke at other places" = mean(hours.smoke.other))
+t2$regular_smoker = ifelse(t2$regular_smoker == 1, "Yes", "No")
+kable(t2, caption = "Table 2: summary statistics of variables", align = "lrrrrrrr")
+
+## Data analysis
+# mean difference ignoring confounding
+(obs_mean_diff <- with(dt.complete, mean(BMD[regular_smoker == 1]) - mean(BMD[regular_smoker == 0])))
+
+# permutation
+permute.BMD <- function(data){
+  # create the permuted data
+  perm <- sample(1:nrow(data), replace = FALSE)
+  perm.data <- data
+  perm.data$regular_smoker = data$regular_smoker[perm]
+  
+  # calculate the mean differences on permuted data
+  perm.mean.diff <- with(perm.data,
+                         mean(BMD[regular_smoker == 1]) - mean(BMD[regular_smoker == 0]))
+  return(perm.mean.diff)
+}
+
+set.seed(47)
+sampling.dist <- data.frame(replicate(1e4, permute.BMD(dt.complete)))
+colnames(sampling.dist) <- "perm_mean_diff"
+
+p <- mean(sampling.dist > obs_mean_diff)
+
+ggplot(sampling.dist, aes(x = perm_mean_diff, y=..density..)) +
+  geom_density() + 
+  geom_vline(xintercept = obs_mean_diff, color = "red") + 
+  labs(title = "Figure 1. Permutated mean difference in BMD between smokers vs non-smokers",
+       x = "Mean difference generated from permutation")
+
+mean(sampling.dist > obs_mean_diff) # p-value
+
+## Confounders
+# propensity score
+propen.model <- glm(regular_smoker ~ AGE0 + ALCHSRV0 + 
+                      num.smoker.house + days.smoke.work + hours.smoke.other, family=binomial, data=dt.complete)
+
+propensities <- predict(propen.model, data=dt.complete, type="response")
+dt.pred.propen <- data.frame(propensities=propensities, regular_smoker=dt.complete$regular_smoker)
+
+ggplot(dt.pred.propen, 
+       aes(x = propensities, y = ..density.., color = (regular_smoker == 1))) +
+  geom_density() + 
+  labs(title = "Figure 2. propensity scores by regular smoking status", 
+       color = "Regular Smoker?",
+       x = "Propensity scores")
+
+trunc.propen <- propensities %>% pmin(0.95) %>% pmax(0.05) ## truncated propensity score
+range(trunc.propen)
+
+npat <- nrow(dt.complete)
+weights <- rep(0, npat)
+
+## for patients who are regular smoker
+representative.propen <- sum(dt.complete$regular_smoker) / npat
+actual.propen <- trunc.propen
+
+regular_smoker.ind <- which(dt.complete$regular_smoker == 1)
+weights[regular_smoker.ind] <- representative.propen/actual.propen[regular_smoker.ind]
+weights[-regular_smoker.ind]<- (1 - representative.propen)/(1- actual.propen[-regular_smoker.ind])
+
+ggplot(data.frame(weights = weights), aes(x=weights, y =..density..)) + 
+  geom_histogram() + labs(title = "Figure 3. weights for the study population (N = 2097)")
+
+# new estimate with inverse weight
+regular_smoker.prob.est <- with(dt.complete,
+                                mean((weights*BMD)[regular_smoker.ind]))
+non_regular_smoker.prob.est <- with(dt.complete,
+                                    mean((weights*BMD)[-regular_smoker.ind]))
+(propen.diff <- regular_smoker.prob.est - non_regular_smoker.prob.est)
+
+# permutation with propensity score
+permute.propen <- function(data){
+  n <- length(data$BMD)
+  label <- rbinom(n,1,trunc.propen)
+  weights <- rep(0,n)  
+  representative <- mean(label)
+  actual <- trunc.propen
+  ind.t <- which(label == 1)
+  weights[ind.t] <- (representative/actual)[ind.t]
+  weights[-ind.t] <- ((1-representative)/(1-actual))[-ind.t]
+  perm.propen.diff <- with(data, mean((weights*BMD)[ind.t]) - mean((weights*BMD)[-ind.t]))
+  return(perm.propen.diff)
+}
+
+set.seed(47)
+rerandomized.diffs <- data.frame(replicate(1e3, permute.propen(dt.complete)))
+colnames(rerandomized.diffs) <- "perm.propen.diff"
+ggplot(data.frame(diffs = rerandomized.diffs), 
+       aes(x = perm.propen.diff, y = ..density..)) +
+  geom_density() + 
+  geom_vline(xintercept = propen.diff, color = "red") + 
+  labs(title = "Figure 4. Permutated weighted mean difference in BMD between smokers vs non-smokers",
+       x = "Weighted mean difference generated from permutation")
+
+mean(rerandomized.diffs > propen.diff) # p-value
+
+## Standardization
+outcome.regression <- lm(BMD ~ regular_smoker + AGE0 + ALCHSRV0 + 
+                           num.smoker.house + days.smoke.work + hours.smoke.other, data=dt.complete)
+
+dt.regular_smoker <- dt.complete %>% mutate(regular_smoker = 1)
+dt.non_regular_smoker <- dt.complete %>% mutate(regular_smoker = 0)
+
+(standardized.est <- mean(  predict(outcome.regression, 
+                                    dt.regular_smoker, 
+                                    type = "response") -
+                              predict(outcome.regression, 
+                                      dt.non_regular_smoker, 
+                                      type = "response")))
+
+# binary BMD
+dt.complete$high_BMD <- (dt.complete$BMD > median(dt.complete$BMD))
+outcome.regression <- glm(high_BMD ~ regular_smoker + AGE0 + ALCHSRV0 + 
+                           num.smoker.house + days.smoke.work + hours.smoke.other, 
+                         family = "binomial", data=dt.complete)
+
+dt.regular_smoker <- dt.complete %>% mutate(regular_smoker = 1)
+dt.non_regular_smoker <- dt.complete %>% mutate(regular_smoker = 0)
+
+(standardized.est <- mean(predict(outcome.regression, 
+                                    dt.regular_smoker, 
+                                    type = "response") -
+                              predict(outcome.regression, 
+                                      dt.non_regular_smoker, 
+                                      type = "response")))
+```
